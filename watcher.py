@@ -172,6 +172,7 @@ def apply_size(hwnd, reason, event_time=0):
     if r:
         _adjusted.add(hwnd)
         _adjust_time[hwnd] = now
+        ensure_guard_timer()
         log("ADJUSTED hwnd=%d -> %dx%d reason=%s latency=%sms"
             % (hwnd, TARGET_W, TARGET_H, reason, latency))
     else:
@@ -179,17 +180,45 @@ def apply_size(hwnd, reason, event_time=0):
             % (hwnd, kernel32.GetLastError(), reason))
 
 
+def normalize_via_placement(hwnd, tag):
+    """实际矩形与 normal rect 同步规格化（保持当前位置）。
+    CC GUI 的持久化恢复逻辑只把 normal rect 写成 DPI 混淆值(0.8 倍)，
+    只改实际矩形会让"最小化→恢复"回退到错误尺寸，故两者必须一起修。"""
+    wp = WINDOWPLACEMENT()
+    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+    if not user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+        return False
+    cur = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(cur))
+    rc = wp.rcNormalPosition
+    nw = rc.right - rc.left
+    nh = rc.bottom - rc.top
+    cw = cur.right - cur.left
+    ch = cur.bottom - cur.top
+    if (abs(nw - TARGET_W) <= 2 and abs(nh - TARGET_H) <= 2
+            and abs(cw - TARGET_W) <= 2 and abs(ch - TARGET_H) <= 2):
+        return True
+    wp.rcNormalPosition.left = cur.left
+    wp.rcNormalPosition.top = cur.top
+    wp.rcNormalPosition.right = cur.left + TARGET_W
+    wp.rcNormalPosition.bottom = cur.top + TARGET_H
+    if user32.SetWindowPlacement(hwnd, ctypes.byref(wp)):
+        log("NORMALIZED hwnd=%d cur=%dx%d normal=%dx%d -> %dx%d (%s)"
+            % (hwnd, cw, ch, nw, nh, TARGET_W, TARGET_H, tag))
+        return True
+    log("NORMALIZE FAILED hwnd=%d err=%d" % (hwnd, kernel32.GetLastError()))
+    return False
+
+
 def guard_check(hwnd, event_time):
-    """调整后守卫：CC GUI 存在"创建后恢复持久化尺寸"逻辑（含逻辑/物理 DPI 混淆），
-    会覆盖 CREATE 时的调整。守卫期(3s)内发现尺寸被改走则补救一次并封缄；
+    """调整后守卫：守卫窗内发现实际矩形被改走则补救（实际+normal 同步）；
     守卫期后任何变动视为用户手动操作，绝不干预。"""
     if hwnd not in _adjusted or hwnd in _sealed:
         return
     now = kernel32.GetTickCount()
     dt = (now - _adjust_time.get(hwnd, now)) & 0xFFFFFFFF
     if dt > POST_ADJUST_GUARD_MS:
-        _sealed.add(hwnd)
-        return
+        return  # 封缄由守卫定时器统一执行
     wr = wintypes.RECT()
     if not user32.GetWindowRect(hwnd, ctypes.byref(wr)):
         _sealed.add(hwnd)
@@ -198,16 +227,33 @@ def guard_check(hwnd, event_time):
     h = wr.bottom - wr.top
     if abs(w - TARGET_W) <= 2 and abs(h - TARGET_H) <= 2:
         return
-    r = user32.SetWindowPos(hwnd, 0, 0, 0, TARGET_W, TARGET_H,
-                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)
-    # 不 sealed：守卫窗内允许多次补救（覆盖逻辑可能分多步/多次执行）；
-    # _adjust_time 保持首次调整时间，窗长硬顶 12s，超时后 sealed 不再干预
-    if r:
-        latency = (now - event_time) & 0xFFFFFFFF if event_time else -1
-        log("RE-ADJUSTED hwnd=%d %dx%d -> %dx%d (guard %dms) latency=%sms"
-            % (hwnd, w, h, TARGET_W, TARGET_H, dt, latency))
-    else:
-        log("RE-ADJUST FAILED hwnd=%d err=%d" % (hwnd, kernel32.GetLastError()))
+    latency = (now - event_time) & 0xFFFFFFFF if event_time else -1
+    normalize_via_placement(hwnd, "guard dt=%dms latency=%sms" % (dt, latency))
+
+
+TIMERPROC = ctypes.WINFUNCTYPE(None, wintypes.HWND, wintypes.UINT,
+                               ctypes.c_size_t, wintypes.DWORD)
+_guard_timer_id = [None]
+
+
+@TIMERPROC
+def guard_timer_proc(hwnd, msg, timer_id, tick):
+    """守卫窗到期：对所有已调整未封缄窗口做最终 normal rect 修正并封缄。"""
+    user32.KillTimer(0, timer_id)
+    _guard_timer_id[0] = None
+    for h in list(_adjusted):
+        if h in _sealed:
+            continue
+        if user32.IsWindow(h):
+            normalize_via_placement(h, "final-seal")
+        _sealed.add(h)
+    log("guard window closed, sealed=%d" % len(_sealed))
+
+
+def ensure_guard_timer():
+    if _guard_timer_id[0] is None:
+        tid = user32.SetTimer(0, 0, POST_ADJUST_GUARD_MS + 1000, guard_timer_proc)
+        _guard_timer_id[0] = tid
 
 
 def fix_existing():

@@ -1,0 +1,5 @@
+__pycache__/
+watcher.log
+watcher.pid
+restore-result.txt
+repo-staging/

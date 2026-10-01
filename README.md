@@ -79,6 +79,13 @@ Then delete the folder. Nothing else is touched.
 - The window is created visible (CC GUI has no hidden-creation hook), so the resize
   happens within the first event callback after creation. With the borderless window +
   WebView white-screen startup, no flicker or jump is perceptible in practice.
+- **Window size is locked for 12 s after each launch** (guard window against CC GUI's
+  persisted-size restore, which writes a DPI-confused 0.8× value into the window's
+  normal rect). After the guard timer seals (~13 s), you can resize freely.
+  Minimize → restore was verified to come back at the target size.
+  每次启动后 12 秒内窗口尺寸被锁定（对抗 CC GUI 持久化恢复逻辑，它会把一个
+  0.8 倍的 DPI 混淆值写入窗口恢复记忆），约 13 秒封缄后即可自由调整；
+  最小化→恢复路径已实测恢复正常。
 
 ## License
 
